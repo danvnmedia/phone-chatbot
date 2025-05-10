@@ -3,10 +3,21 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+
+# ------------------------------------------------------------------------
+# MODIFIED: May 2025 by Dan Vu
+# Purpose: Assessment for Pipecat Phone Chatbot - Silence Detection & Termination
+#
+# - Added SilenceDetectorProcessor for silence detection and TTS prompts.
+# - Graceful call termination after 3 unanswered prompts.
+# - Post-call summary logging.
+# - See "# --- ADDED: ..." comments for details.
+# ------------------------------------------------------------------------
 import argparse
 import asyncio
 import os
 import sys
+import time
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -15,12 +26,12 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame
+from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
@@ -33,6 +44,82 @@ logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
+
+
+class SilenceDetectorProcessor(FrameProcessor):
+    """Detects silence, plays TTS after 10s, terminates after 3 unanswered prompts, logs summary."""
+    def __init__(self, tts, task, silence_prompt="Are you still there?", silence_timeout=10, max_unanswered=3):
+        super().__init__()
+        self.tts = tts
+        self.task = task
+        self.silence_prompt = silence_prompt
+        self.silence_timeout = silence_timeout
+        self.max_unanswered = max_unanswered
+        self.last_speech_time = time.time()
+        self.silence_events = 0
+        self.unanswered_count = 0
+        self.awaiting_response = False
+        self.call_start_time = time.time()
+        self.call_end_time = None
+        self.terminated = False
+        self.user_speaking = False
+        logger.info(f"[SilenceDetector] Initialized: timeout={silence_timeout}s, max_unanswered={max_unanswered}")
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        now = time.time()
+        # Track user speech
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self.user_speaking = True
+            self.last_speech_time = now
+            if self.awaiting_response:
+                logger.info(f"[SilenceDetector] User started speaking, reset unanswered count.")
+                self.unanswered_count = 0
+                self.awaiting_response = False
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self.user_speaking = False
+        # Track transcription
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self.last_speech_time = now
+            if self.awaiting_response:
+                logger.info(f"[SilenceDetector] User responded, reset unanswered count.")
+                self.unanswered_count = 0
+                self.awaiting_response = False
+        # Detect silence
+        if (not self.terminated and not self.awaiting_response and not self.user_speaking and (now - self.last_speech_time) > self.silence_timeout):
+            self.silence_events += 1
+            self.unanswered_count += 1
+            self.awaiting_response = True
+            logger.warning(f"[SilenceDetector] SILENCE DETECTED ({self.silence_timeout}s). Playing prompt #{self.unanswered_count}")
+            await self.task.queue_frames([TTSSpeakFrame(f"{self.silence_prompt} This is attempt {self.unanswered_count} of {self.max_unanswered}.")])
+            # Terminate if max unanswered
+            if self.unanswered_count >= self.max_unanswered:
+                logger.warning(f"[SilenceDetector] TERMINATING CALL: Max unanswered prompts reached!")
+                self.terminated = True
+                self.call_end_time = now
+                await self.task.queue_frames([TTSSpeakFrame("Maximum number of unanswered prompts reached. Ending the call now. Goodbye!")])
+                await self.task.queue_frames([EndTaskFrame()])
+                self.log_call_summary()
+        await self.push_frame(frame, direction)
+
+    def get_stats(self):
+        self.call_end_time = self.call_end_time or time.time()
+        return {
+            "duration": self.call_end_time - self.call_start_time,
+            "silence_events": self.silence_events,
+            "unanswered_prompts": self.unanswered_count,
+        }
+
+    def log_call_summary(self):
+        stats = self.get_stats()
+        logger.warning("=" * 60)
+        logger.warning("POST-CALL SUMMARY")
+        logger.warning("=" * 60)
+        logger.warning(f"Call duration: {stats['duration']:.1f} seconds ({stats['duration']/60:.1f} minutes)")
+        logger.warning(f"Silence events detected: {stats['silence_events']}")
+        logger.warning(f"Unanswered prompts: {stats['unanswered_prompts']}")
+        logger.warning(f"Call termination reason: {'Max unanswered prompts' if self.terminated else 'Normal ending'}")
+        logger.warning("=" * 60)
 
 
 async def main(
@@ -154,6 +241,10 @@ async def main(
     # Create pipeline task
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
+    # Add silence detector to pipeline
+    silence_detector = SilenceDetectorProcessor(tts=tts, task=task)
+    pipeline.processors.insert(1, silence_detector)  # After input
+
     # ------------ EVENT HANDLERS ------------
 
     @transport.event_handler("on_first_participant_joined")
@@ -165,6 +256,9 @@ async def main(
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
+        # Log post-call summary
+        silence_detector.call_end_time = time.time()
+        silence_detector.log_call_summary()
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------

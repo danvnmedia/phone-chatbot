@@ -3,10 +3,22 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+
+# ------------------------------------------------------------------------
+# MODIFIED: May 2025 by Dan Vu
+# Purpose: Assessment for Pipecat Phone Chatbot - Silence Detection & Termination
+#
+# - Added SilenceDetectorProcessor to detect user silence and play TTS prompts.
+# - Plays a TTS prompt after 10+ seconds of silence, repeats up to 3 times.
+# - Gracefully terminates the call after 3 unanswered prompts.
+# - Logs a post-call summary (duration, silence events, unanswered prompts).
+# - All changes are clearly commented with "# --- ADDED: ..." in the code.
+# ------------------------------------------------------------------------
 import argparse
 import asyncio
 import os
 import sys
+import time
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -21,6 +33,7 @@ from pipecat.frames.frames import (
     Frame,
     LLMMessagesFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -94,6 +107,100 @@ class SummaryFinished(FrameProcessor):
             self.dial_operator_state.set_summary_finished()
 
         await self.push_frame(frame, direction)
+
+
+class SilenceDetectorProcessor(FrameProcessor):
+    """Detects silence and triggers a TTS prompt after 10+ seconds of silence. Tracks unanswered prompts and repeats prompt up to max_unanswered times if user remains silent."""
+    def __init__(self, tts, task, transport, session_manager, silence_prompt="Are you still there?", silence_timeout=10, max_unanswered=3):
+        super().__init__()
+        # --- ADDED: Silence detection and prompt/termination logic ---
+        self.tts = tts
+        self.task = task
+        self.transport = transport
+        self.session_manager = session_manager
+        self.silence_prompt = silence_prompt
+        self.silence_timeout = silence_timeout
+        self.max_unanswered = max_unanswered
+        self.last_speech_time = time.time()
+        self.last_prompt_time = None  # Track when last prompt was played
+        self.silence_events = 0
+        self.unanswered_count = 0
+        self.awaiting_response = False
+        self.call_start_time = time.time()
+        self.call_end_time = None
+        self.terminated = False
+        # --- END ADDED ---
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        now = time.time()
+        # --- ADDED: Prevent further prompts after termination ---
+        if self.terminated:
+            await self.push_frame(frame, direction)
+            return
+        # --- END ADDED ---
+        # Detect user speech (TranscriptionFrame from customer)
+        # --- ADDED: Reset silence logic if user speaks ---
+        if isinstance(frame, TranscriptionFrame):
+            user_id = getattr(frame, 'user_id', None)
+            operator_id = self.session_manager.get_session_id('operator')
+            if user_id and user_id != operator_id and frame.text.strip():
+                self.last_speech_time = now
+                if self.awaiting_response:
+                    self.unanswered_count = 0
+                    self.awaiting_response = False
+                    self.last_prompt_time = None
+        # --- END ADDED ---
+        # --- ADDED: Repeat prompt if user remains silent, up to max_unanswered ---
+        if self.awaiting_response and self.last_prompt_time and (now - self.last_prompt_time) > self.silence_timeout:
+            if self.unanswered_count < self.max_unanswered:
+                self.silence_events += 1
+                self.unanswered_count += 1
+                logger.warning(f"[SilenceDetector] SILENCE CONTINUES. Playing prompt #{self.unanswered_count}")
+                await self.task.queue_frames([TTSSpeakFrame(f"{self.silence_prompt} This is attempt {self.unanswered_count} of {self.max_unanswered}.")])
+                self.last_prompt_time = now
+                # --- ADDED: Terminate after max_unanswered ---
+                if self.unanswered_count >= self.max_unanswered:
+                    logger.warning(f"[SilenceDetector] TERMINATING CALL: Max unanswered prompts reached!")
+                    self.terminated = True
+                    self.call_end_time = now
+                    await self.task.queue_frames([TTSSpeakFrame("No response detected. Ending the call. Goodbye!")])
+                    await self.task.queue_frames([EndTaskFrame()])
+                    self.awaiting_response = False
+                    self.last_prompt_time = None
+                # --- END ADDED ---
+            else:
+                # Already terminated, do nothing
+                pass
+        # --- END ADDED ---
+        # --- ADDED: Initial silence detection and prompt ---
+        if not self.awaiting_response and (now - self.last_speech_time) > self.silence_timeout and not self.terminated:
+            self.silence_events += 1
+            self.unanswered_count += 1
+            self.awaiting_response = True
+            logger.warning(f"[SilenceDetector] SILENCE DETECTED ({self.silence_timeout}s). Playing prompt #{self.unanswered_count}")
+            await self.task.queue_frames([TTSSpeakFrame(f"{self.silence_prompt} This is attempt {self.unanswered_count} of {self.max_unanswered}.")])
+            self.last_prompt_time = now
+            # --- ADDED: Terminate after max_unanswered ---
+            if self.unanswered_count >= self.max_unanswered:
+                logger.warning(f"[SilenceDetector] TERMINATING CALL: Max unanswered prompts reached!")
+                self.terminated = True
+                self.call_end_time = now
+                await self.task.queue_frames([TTSSpeakFrame("No response detected. Ending the call. Goodbye!")])
+                await self.task.queue_frames([EndTaskFrame()])
+                self.awaiting_response = False
+                self.last_prompt_time = None
+            # --- END ADDED ---
+        # --- END ADDED ---
+        await self.push_frame(frame, direction)
+
+    def get_stats(self):
+        self.call_end_time = self.call_end_time or time.time()
+        return {
+            "duration": self.call_end_time - self.call_start_time,
+            "silence_events": self.silence_events,
+            "unanswered_prompts": self.unanswered_count,
+        }
 
 
 async def main(
@@ -309,6 +416,17 @@ async def main(
         session_manager.get_session_id_ref("operator")
     )
 
+    # Initialize SilenceDetectorProcessor
+    silence_detector = SilenceDetectorProcessor(
+        tts=tts,
+        task=None,  # Will set after task is created
+        transport=transport,
+        session_manager=session_manager,
+        silence_prompt="Are you still there?",
+        silence_timeout=10,
+        max_unanswered=3,
+    )
+
     # Define function to determine if bot should speak
     async def should_speak(self) -> bool:
         result = (
@@ -322,6 +440,7 @@ async def main(
         [
             transport.input(),  # Transport user input
             transcription_modifier,  # Prepends operator transcription with [OPERATOR]
+            silence_detector,  # Silence detection
             context_aggregator.user(),  # User responses
             FunctionFilter(should_speak),
             llm,
@@ -337,6 +456,7 @@ async def main(
         pipeline,
         params=PipelineParams(allow_interruptions=True),
     )
+    silence_detector.task = task  # Set the task reference now
 
     # ------------ EVENT HANDLERS ------------
 
@@ -447,6 +567,10 @@ async def main(
 
     runner = PipelineRunner()
     await runner.run(task)
+    # Log post-call summary
+    silence_detector.call_end_time = time.time()
+    stats = silence_detector.get_stats()
+    logger.info(f"POST-CALL SUMMARY: duration={stats['duration']:.1f}s, silence_events={stats['silence_events']}, unanswered_prompts={stats['unanswered_prompts']}")
 
 
 if __name__ == "__main__":
